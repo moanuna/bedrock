@@ -1,0 +1,139 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CodeBuddy - AI GitHub PR 자동 리뷰 시스템 (Amazon Bedrock Agent)"
+
+Parameters:
+  AgentIdParam:
+    Type: String
+  AliasIdParam:
+    Type: String
+  GitHubTokenParam:
+    Type: String
+    NoEcho: true
+  GitHubSecretParam:
+    Type: String
+    NoEcho: true
+    Default: "codebuddy-secret"
+  SlackWebhookUrlParam:
+    Type: String
+    NoEcho: true
+
+Resources:
+  # ─── IAM Role ────────────────────────────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: codebuddy-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: BedrockAgentPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [bedrock:InvokeAgent, bedrock:InvokeModel, logs:*]
+                Resource: "*"
+
+  # ─── Orchestrator Lambda ────────────────────────────────────────────
+  OrchestratorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: codebuddy-orchestrator
+      Runtime: python3.12
+      Handler: orchestrator.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          AGENT_ID: !Ref AgentIdParam
+          ALIAS_ID: !Ref AliasIdParam
+          GITHUB_TOKEN: !Ref GitHubTokenParam
+          GITHUB_SECRET: !Ref GitHubSecretParam
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrlParam
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              return {'statusCode': 200, 'body': 'OK'}
+
+  # ─── API Gateway ────────────────────────────────────────────────────
+  CodeBuddyApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: CodeBuddyAPI
+
+  ReviewResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CodeBuddyApi
+      ParentId: !GetAtt CodeBuddyApi.RootResourceId
+      PathPart: review
+
+  ReviewMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CodeBuddyApi
+      ResourceId: !Ref ReviewResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrchestratorLambda.Arn}/invocations"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ReviewMethod
+    Properties:
+      RestApiId: !Ref CodeBuddyApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref CodeBuddyApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: CodeBuddyApiKey
+      Enabled: true
+
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: CodeBuddyUsagePlan
+      ApiStages:
+        - ApiId: !Ref CodeBuddyApi
+          Stage: !Ref ApiStage
+      Throttle:
+        BurstLimit: 10
+        RateLimit: 5
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt OrchestratorLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CodeBuddyApi}/*/POST/review"
+
+Outputs:
+  ApiGatewayUrl:
+    Value: !Sub "https://${CodeBuddyApi}.execute-api.${AWS::Region}.amazonaws.com/prod/review"
