@@ -47,7 +47,7 @@ Resources:
     Properties:
       FunctionName: codebuddy-orchestrator
       Runtime: python3.12
-      Handler: index.handler # <--- 여기 수정됨!
+      Handler: index.handler
       Role: !GetAtt LambdaExecutionRole.Arn
       Timeout: 300
       MemorySize: 1024
@@ -59,7 +59,7 @@ Resources:
           GITHUB_SECRET: !Ref GitHubSecretParam
           SLACK_WEBHOOK_URL: !Ref SlackWebhookUrlParam
       Code:
-        ZipFile: | # <--- 아래 파이썬 코드가 통째로 실제 로직으로 교체됨!
+        ZipFile: |
           import json
           import os
           import hmac
