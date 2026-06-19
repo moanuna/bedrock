@@ -81,34 +81,54 @@ def handler(event, context):
         'Access-Control-Allow-Origin': '*'
     }
 
+    body = {}
     try:
         # OPTIONS 요청 처리 (CORS preflight)
         if event.get('httpMethod') == 'OPTIONS':
             return {'statusCode': 200, 'headers': headers, 'body': ''}
 
-        body = event.get('body', '{}')
-        if isinstance(body, str):
-            body = json.loads(body)
+        # 1. Body 추출 및 None/Base64 인코딩 방어
+        raw_body_str = event.get('body')
+        if raw_body_str is None:
+            raw_body_str = '{}'
 
-        # GitHub Webhook 서명 검증
+        if event.get('isBase64Encoded', False):
+            import base64
+            raw_body_bytes = base64.b64decode(raw_body_str)
+            raw_body_str = raw_body_bytes.decode('utf-8')
+        else:
+            raw_body_bytes = raw_body_str.encode('utf-8') if isinstance(raw_body_str, str) else b''
+
+        # 2. JSON 안전 파싱 (실패 시 AttributeError/500 에러 대신 400 응답)
+        try:
+            body = json.loads(raw_body_str) if isinstance(raw_body_str, str) else raw_body_str
+            if not isinstance(body, dict):
+                body = {}
+        except json.JSONDecodeError:
+            return {
+                'statusCode': 400,
+                'headers': headers,
+                'body': json.dumps({'error': '유효하지 않은 JSON 페이로드입니다.'}, ensure_ascii=False)
+            }
+
+        # 3. GitHub Webhook 서명 검증 (정확한 원본 바이트 페이로드 사용)
         signature = event.get('headers', {}).get('X-Hub-Signature-256', '')
-        raw_body = event.get('body', '').encode() if isinstance(event.get('body'), str) else b''
-        if signature and not verify_github_signature(raw_body, signature):
+        if signature and not verify_github_signature(raw_body_bytes, signature):
             return {
                 'statusCode': 401,
                 'headers': headers,
                 'body': json.dumps({'error': 'Invalid signature'})
             }
 
-        # PR URL 추출 (직접 호출 또는 Webhook)
+        # 4. PR URL 추출 (직접 호출 또는 Webhook 분기 처리 안전성 강화)
         pr_url = body.get('pr_url')
         if not pr_url:
-            # GitHub Webhook 형식
+            # GitHub Webhook 형식 파싱
             pull_request = body.get('pull_request', {})
             pr_url = pull_request.get('html_url')
             action = body.get('action', '')
 
-            # PR이 열렸을 때만 처리
+            # PR이 열리거나 변경되었을 때만 처리
             if action not in ['opened', 'synchronize']:
                 return {
                     'statusCode': 200,
@@ -120,7 +140,7 @@ def handler(event, context):
             return {
                 'statusCode': 400,
                 'headers': headers,
-                'body': json.dumps({'error': 'pr_url이 필요합니다'})
+                'body': json.dumps({'error': 'pr_url이 필요합니다'}, ensure_ascii=False)
             }
 
         # PR 번호로 세션 ID 생성
