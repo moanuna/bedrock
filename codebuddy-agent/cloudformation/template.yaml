@@ -47,7 +47,7 @@ Resources:
     Properties:
       FunctionName: codebuddy-orchestrator
       Runtime: python3.12
-      Handler: orchestrator.handler
+      Handler: index.handler # <--- 여기 수정됨!
       Role: !GetAtt LambdaExecutionRole.Arn
       Timeout: 300
       MemorySize: 1024
@@ -59,9 +59,77 @@ Resources:
           GITHUB_SECRET: !Ref GitHubSecretParam
           SLACK_WEBHOOK_URL: !Ref SlackWebhookUrlParam
       Code:
-        ZipFile: |
+        ZipFile: | # <--- 아래 파이썬 코드가 통째로 실제 로직으로 교체됨!
+          import json
+          import os
+          import hmac
+          import hashlib
+          import boto3
+          import urllib.request
+
+          AGENT_ID = os.environ.get('AGENT_ID', '')
+          ALIAS_ID = os.environ.get('ALIAS_ID', '')
+          GITHUB_SECRET = os.environ.get('GITHUB_SECRET', '')
+          SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL', '')
+
+          bedrock_agent = boto3.client('bedrock-agent-runtime', region_name='ap-northeast-2')
+
+          def verify_github_signature(payload_body: bytes, signature: str) -> bool:
+              if not GITHUB_SECRET: return True
+              expected = 'sha256=' + hmac.new(GITHUB_SECRET.encode(), payload_body, hashlib.sha256).hexdigest()
+              return hmac.compare_digest(expected, signature)
+
+          def send_slack_notification(pr_url: str, status: str, summary: str):
+              if not SLACK_WEBHOOK_URL: return
+              emoji = "✅" if status == "success" else "❌"
+              message = {"text": f"{emoji} *CodeBuddy 리뷰 완료*\nPR: {pr_url}\n상태: {status}\n요약: {summary[:200]}..."}
+              
+              req = urllib.request.Request(
+                  SLACK_WEBHOOK_URL, 
+                  data=json.dumps(message).encode('utf-8'), 
+                  headers={'Content-Type': 'application/json'},
+                  method='POST'
+              )
+              try:
+                  urllib.request.urlopen(req, timeout=5)
+              except Exception as e:
+                  print(f"Slack 전송 에러: {e}")
+
           def handler(event, context):
-              return {'statusCode': 200, 'body': 'OK'}
+              headers = {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}
+              
+              try:
+                  if event.get('httpMethod') == 'OPTIONS': return {'statusCode': 200, 'headers': headers, 'body': ''}
+                  
+                  raw_body_str = event.get('body', '{}') or '{}'
+                  raw_body_bytes = raw_body_str.encode('utf-8')
+                  body = json.loads(raw_body_str)
+                  
+                  signature = event.get('headers', {}).get('X-Hub-Signature-256', '')
+                  if signature and not verify_github_signature(raw_body_bytes, signature):
+                      return {'statusCode': 401, 'body': json.dumps({'error': 'Invalid signature'})}
+                  
+                  pr_url = body.get('pr_url') or body.get('pull_request', {}).get('html_url')
+                  if not pr_url:
+                      return {'statusCode': 200, 'body': json.dumps({'message': 'PR ignored or missing'})}
+                  
+                  session_id = f"webhook-{pr_url.split('/')[-1]}"
+                  
+                  prompt = f"다음 GitHub PR을 분석해주세요: {pr_url}\n1. 코드 가져오기\n2. 복잡도 분석\n3. 테스트 코드 제안\n4. 리팩토링 제안\n5. PR 리뷰 댓글 등록"
+                  
+                  response = bedrock_agent.invoke_agent(
+                      agentId=AGENT_ID, agentAliasId=ALIAS_ID, sessionId=session_id, inputText=prompt
+                  )
+                  
+                  result = ''.join([event['chunk']['bytes'].decode('utf-8') for event in response['completion'] if 'chunk' in event])
+                  
+                  send_slack_notification(pr_url, "success", result)
+                  
+                  return {'statusCode': 200, 'headers': headers, 'body': json.dumps({'message': 'Success', 'pr_url': pr_url})}
+                  
+              except Exception as e:
+                  print(e)
+                  return {'statusCode': 500, 'headers': headers, 'body': json.dumps({'error': str(e)})}
 
   # ─── API Gateway ────────────────────────────────────────────────────
   CodeBuddyApi:
